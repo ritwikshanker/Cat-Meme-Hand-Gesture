@@ -80,16 +80,30 @@ Then open <http://localhost:8000>.
 
 ## Deploy
 
-Fully static — drop it anywhere that serves over HTTPS.
+Fully static, so anywhere that serves over HTTPS works. HTTPS is not optional
+here — browsers refuse camera access without it.
 
-- **Netlify Drop** — drag this folder onto <https://app.netlify.com/drop>.
-  You get an HTTPS URL immediately, which is what you want for sharing to a
-  phone.
-- **GitHub Pages** — push the folder to a repo and enable Pages on the branch.
+### GitHub Pages
 
-Deploy only `index.html`, `style.css`, `script.js`, and `images/`. The
-`.venv/`, `.idea/`, `main.py`, and `pyproject.toml` files are leftovers from
-the PyCharm scaffold and aren't part of the app.
+Pages serves over HTTPS on `*.github.io`, so the camera works. Create an empty
+repo on GitHub, then:
+
+```bash
+git remote add origin https://github.com/<you>/<repo>.git
+git push -u origin main
+```
+
+Then in the repo: **Settings → Pages → Source → Deploy from a branch**, pick
+`main` and `/ (root)`, and save. The site appears at
+`https://<you>.github.io/<repo>/` within a minute or two.
+
+All asset paths are relative, so it works under the `/<repo>/` subpath without
+changes. The `.nojekyll` file stops Pages running the files through Jekyll.
+
+### Netlify Drop
+
+Drag the folder onto <https://app.netlify.com/drop> for an instant HTTPS URL,
+no repo needed.
 
 ## On phones and tablets
 
