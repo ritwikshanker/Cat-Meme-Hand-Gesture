@@ -11,6 +11,10 @@ const HOLD_MS     = 300;   // a gesture must be held this long before it fires
 const COOLDOWN_MS = 1000;  // re-firing the SAME gesture waits this long
 const RELEASE_MS  = 250;   // tolerate this much lost tracking before dropping
 
+const MODEL_TIMEOUT_MS = 45000;  // WASM runtime + model download from the CDN
+const SEND_TIMEOUT_MS  = 10000;  // a single frame should never take this long
+const STALL_MS         = 12000;  // frames going out with nothing coming back
+
 const MEDIAPIPE_VERSION = '0.4.1675469240';
 const IDLE_SRC = 'images/idle.png';
 
@@ -134,8 +138,12 @@ function features(raw, aspect) {
     })(),
     // shush should be an upright finger, not a sideways point
     indexUp:    lm[8].y < lm[6].y && lm[6].y < lm[5].y,
-    thumbUp:    lm[4].y < lm[2].y - 0.04,
-    thumbDown:  lm[4].y > lm[2].y + 0.04,
+    // In palm lengths, like every other measurement here. A raw 0.04 of the
+    // frame height meant a different amount of thumb depending on how large
+    // the hand landed in frame, and a hand at arm's length from a phone lands
+    // much smaller than one in front of a laptop.
+    thumbUp:    (lm[2].y - lm[4].y) / scale > 0.15,
+    thumbDown:  (lm[4].y - lm[2].y) / scale > 0.15,
   };
 }
 
@@ -248,6 +256,7 @@ const camSpinner = document.getElementById('camSpinner');
 const flipBtn    = document.getElementById('flipBtn');
 const errorEl    = document.getElementById('camError');
 const errorMsgEl = document.getElementById('camErrorMsg');
+const errorTitle = document.getElementById('camErrorTitle');
 const retryBtn   = document.getElementById('retryBtn');
 const statusDot  = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
@@ -288,6 +297,7 @@ const diag = {
       ['video', this.notes.video || '-'],
       ['frame aspect', this.notes.aspect || '-'],
       ['MediaPipe', typeof window.Hands === 'function' ? 'loaded' : 'MISSING'],
+      ['model', this.notes.model || '-'],
       ['frames sent', String(this.sent)],
       ['results in', String(this.results)],
       ['fps', String(this.fps)],
@@ -531,11 +541,12 @@ let hands  = null;
 let stream = null;
 let rafId  = null;
 
-function showError(message) {
+function showError(message, label = 'Camera off', title = 'Camera unavailable') {
   camSpinner.hidden = true;
+  errorTitle.textContent = title;
   errorMsgEl.textContent = message;
   errorEl.hidden = false;
-  setStatus('error', 'Camera off');
+  setStatus('error', label);
 }
 
 function describeCameraError(err) {
@@ -611,6 +622,18 @@ function isLowPower() {
   return coarse || fewCores;
 }
 
+/** Reject if `promise` has not settled in `ms`, so nothing can hang forever. */
+function withTimeout(promise, ms, what) {
+  let timer;
+  const bell = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error(what + ' timed out after ' + ms + 'ms'),
+                                 { name: 'TimeoutError' })),
+      ms);
+  });
+  return Promise.race([promise, bell]).finally(() => clearTimeout(timer));
+}
+
 function buildHands() {
   if (hands) return hands;
 
@@ -631,7 +654,15 @@ function buildHands() {
   return hands;
 }
 
+// Bumped on every start(). Startup is a chain of awaits and a phone can be
+// backgrounded partway through any of them, which tears the stream down from
+// visibilitychange; without this the half-finished run kept going against a
+// stream that no longer existed and parked the app on an error nothing cleared.
+let startGen = 0;
+
 async function start() {
+  const gen = ++startGen;
+
   errorEl.hidden = true;
   camSpinner.hidden = false;
   setStatus('', 'Starting…');
@@ -642,14 +673,18 @@ async function start() {
   // MediaPipe's Camera helper open its own stream. Desktops reacquire
   // instantly; phones often hand back a stream that never emits a frame, which
   // looked like "nothing works" with no error to show for it.
+  let opened;
   try {
     stopStream();
-    stream = await openStream();
+    opened = await openStream();
+    if (gen !== startGen) { opened.getTracks().forEach((t) => t.stop()); return; }
+    stream = opened;
     diag.note('stream', stream.getVideoTracks().map((t) => {
       const st = t.getSettings ? t.getSettings() : {};
       return `${st.width || '?'}x${st.height || '?'} ${st.facingMode || ''}`;
     }).join(', '));
   } catch (err) {
+    if (gen !== startGen) return;
     diag.fail('getUserMedia', err);
     showError(describeCameraError(err));
     return;
@@ -663,11 +698,13 @@ async function start() {
   } catch (err) {
     diag.note('play', 'rejected: ' + (err && err.name));   // often plays anyway
   }
+  if (gen !== startGen) return;
 
   try {
     await waitForVideo();
     diag.note('video', `${video.videoWidth}x${video.videoHeight}`);
   } catch (err) {
+    if (gen !== startGen) return;
     diag.fail('video', err);
     showError('The camera opened but never sent a frame. Close any other app using '
             + 'the camera, then hit Retry.');
@@ -683,16 +720,59 @@ async function start() {
     return;
   }
 
+  // Pull the WASM runtime and the landmark model down explicitly. They are
+  // ~12 MB from the CDN and are otherwise fetched lazily inside the first
+  // send(), where a slow or blocked mobile connection produced no error at
+  // all: the status line said "Show me a hand", the camera spinner never
+  // cleared, and no gesture could ever fire.
+  setStatus('', 'Loading model…');
+  diag.note('model', 'loading…');
+  try {
+    await withTimeout(detector.initialize(), MODEL_TIMEOUT_MS, 'model download');
+    diag.note('model', 'ready');
+  } catch (err) {
+    diag.fail('model', err);
+    showError('The hand-tracking model could not be downloaded (' + err.name + '). '
+            + 'It is a ~12 MB one-time download from a CDN — check the connection, '
+            + 'or any blocker that might be stopping cdn.jsdelivr.net, then hit Retry.',
+              'Model failed', 'Hand tracking unavailable');
+    return;
+  }
+  if (gen !== startGen) return;   // a newer start() took over while we waited
+
   // Drive frames ourselves rather than via MediaPipe's Camera helper, so a
   // stalled or throwing send() is visible instead of silently swallowed.
   let busy = false;
+  let lastResults = diag.results;
+  let lastProgress = performance.now();
+
   const pump = () => {
     rafId = requestAnimationFrame(pump);
-    if (busy || video.readyState < 2) return;
+    if (video.readyState < 2) return;
+
+    // A send() that never settles used to wedge `busy` on forever and kill
+    // the loop in silence. Time it out so one bad frame costs one frame.
+    if (busy) return;
+
+    const now = performance.now();
+    if (diag.results !== lastResults) {
+      lastResults = diag.results;
+      lastProgress = now;
+    } else if (now - lastProgress > STALL_MS) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+      diag.lastError = 'no results for ' + Math.round((now - lastProgress) / 1000) + 's';
+      showError('Hand tracking started but stopped responding. This usually means the '
+              + 'browser could not keep the tracker running. Hit Retry, and close other '
+              + 'tabs or apps using the camera.',
+                'Tracking stalled', 'Hand tracking stopped');
+      return;
+    }
+
     busy = true;
     diag.sent++;
-    Promise.resolve()
-      .then(() => detector.send({ image: video }))
+    withTimeout(Promise.resolve().then(() => detector.send({ image: video })),
+                SEND_TIMEOUT_MS, 'frame')
       .catch((err) => { diag.sendErrors++; diag.lastError = String((err && err.message) || err); })
       .finally(() => { busy = false; });
   };
@@ -721,12 +801,19 @@ flipBtn.addEventListener('click', () => {
 retryBtn.addEventListener('click', start);
 
 // Release the camera when the tab is hidden; pick it back up on return.
+// Phones background the page constantly — permission sheets, the notification
+// shade, a lock — so the resume path has to be the one that always works.
+// Restarting on "no live stream OR no running pump" rather than on `!stream`
+// matters: a run torn down mid-startup could leave a non-null `stream` with
+// nothing driving it, and the old guard then refused to restart it forever.
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     stopStream();
-  } else if (errorEl.hidden && !stream) {
-    start();
+    return;
   }
+  if (!errorEl.hidden) return;   // wait for Retry; the error is still on screen
+  const live = stream && stream.getVideoTracks().some((t) => t.readyState === 'live');
+  if (!live || rafId === null) start();
 });
 
 /* ---------------- go ---------------- */
