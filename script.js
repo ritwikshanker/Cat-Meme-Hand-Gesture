@@ -224,20 +224,68 @@ function classify(h) {
   return null;
 }
 
+/** How far a hand's centre sits from the middle of the frame. */
+const fromCentre = (c) => Math.hypot(c.fit.cx - 0.5, c.fit.cy - 0.5);
+
+/** Where a hand sits in the frame, and how much of it ran off the edge. */
+function frameFit(raw) {
+  let cx = 0, cy = 0, off = 0;
+  for (const p of raw) {
+    cx += p.x;
+    cy += p.y;
+    if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) off++;
+  }
+  return { cx: cx / raw.length, cy: cy / raw.length, clipped: off / raw.length };
+}
+
+// How far a hand's centre may sit from the middle of the frame and still count
+// as "shown to the camera", as a fraction of the frame. On a phone you are
+// HOLDING the thing, so the hand gripping it sits in a corner of a wide selfie
+// lens and gets tracked exactly like a deliberate gesture; measured at 0.43
+// from centre against 0.02 for a hand held up deliberately. This keeps the
+// middle ~2/3 of the frame and drops the corners.
+const CENTRE_RADIUS = 0.34;
+
+// How many of the hands in the last frame survived that filter — surfaced in
+// the diagnostics so "it sees two hands but ignores one" is visible on a phone.
+let keptHands = 0;
+
 /**
  * Whole-frame detection across every hand MediaPipe found.
  * `aspect` is the frame's width/height; see toIsotropic above.
+ *
+ * This used to classify whichever hand MediaPipe happened to list first, which
+ * is fine on a laptop where the only hand in shot is the one you are showing.
+ * On a phone the hand holding the device is in shot permanently, MediaPipe
+ * returns hands in no meaningful order, and the tracker will happily stay
+ * locked on the grip — so the app pinned itself to whatever that hand looked
+ * like and stopped responding to the hand actually making gestures.
  */
 function detect(handsLandmarks, aspect = 1) {
   if (!handsLandmarks || !handsLandmarks.length) return null;
 
-  const feats = handsLandmarks
+  keptHands = 0;
+  const cands = handsLandmarks
     .filter((lm) => lm && lm.length >= 21)
-    .map((lm) => features(lm, aspect));
+    .map((lm) => ({ fit: frameFit(lm), f: features(lm, aspect) }))
+    // A grip hand sits out at the edge, and often runs off it; a hand held up
+    // to the camera does neither.
+    .filter((c) => c.fit.clipped <= 0.2 && fromCentre(c) <= CENTRE_RADIUS);
 
-  if (!feats.length) return null;
-  if (feats.length >= 2 && isHeart(feats[0], feats[1])) return 'heart';
-  return classify(feats[0]);
+  keptHands = cands.length;
+  if (!cands.length) return null;
+
+  // Nearest the middle first: that is the one being shown, not the one that
+  // merely happens to be in shot.
+  cands.sort((a, b) => fromCentre(a) - fromCentre(b));
+
+  if (cands.length >= 2 && isHeart(cands[0].f, cands[1].f)) return 'heart';
+
+  for (const c of cands) {
+    const g = classify(c.f);
+    if (g) return g;
+  }
+  return null;
 }
 
 /* =========================================================================
@@ -302,6 +350,7 @@ const diag = {
       ['results in', String(this.results)],
       ['fps', String(this.fps)],
       ['hands seen', String(this.hands)],
+      ['hands used', String(keptHands)],
       ['gesture', this.lastGesture || 'none'],
       ['send errors', String(this.sendErrors)],
     ];
