@@ -73,6 +73,21 @@ const IDX = {
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 /**
+ * MediaPipe normalises x by the frame's WIDTH and y by its HEIGHT, so on any
+ * non-square frame the two axes have different scales and a plain distance
+ * between two landmarks is stretched. Every threshold below compares a mostly
+ * horizontal distance against a mostly vertical one, so that stretch changes
+ * the verdict: the same hand measures ~0.87 on a 640x480 laptop frame and
+ * ~2.05 on a 720x1280 portrait phone frame.
+ *
+ * Rescaling x by the aspect ratio puts both axes in the same units (frame
+ * heights), which makes every measurement below shape-independent.
+ */
+function toIsotropic(lm, aspect) {
+  return lm.map((p) => ({ x: p.x * aspect, y: p.y, z: p.z }));
+}
+
+/**
  * Per-hand feature extraction.
  *
  * Extension is measured by distance from the wrist rather than raw y, so it
@@ -81,7 +96,8 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
  * Everything else is normalised by palm length so it works at any distance
  * from the camera.
  */
-function features(lm) {
+function features(raw, aspect) {
+  const lm = toIsotropic(raw, aspect);
   const wrist = lm[0];
   const scale = Math.max(dist(wrist, lm[9]), 1e-6);   // wrist → middle MCP
 
@@ -200,13 +216,16 @@ function classify(h) {
   return null;
 }
 
-/** Whole-frame detection across every hand MediaPipe found. */
-function detect(handsLandmarks) {
+/**
+ * Whole-frame detection across every hand MediaPipe found.
+ * `aspect` is the frame's width/height; see toIsotropic above.
+ */
+function detect(handsLandmarks, aspect = 1) {
   if (!handsLandmarks || !handsLandmarks.length) return null;
 
   const feats = handsLandmarks
     .filter((lm) => lm && lm.length >= 21)
-    .map(features);
+    .map((lm) => features(lm, aspect));
 
   if (!feats.length) return null;
   if (feats.length >= 2 && isHeart(feats[0], feats[1])) return 'heart';
@@ -232,6 +251,60 @@ const errorMsgEl = document.getElementById('camErrorMsg');
 const retryBtn   = document.getElementById('retryBtn');
 const statusDot  = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
+
+/* =========================================================================
+   Diagnostics — tap the status badge (or add ?debug=1) to open.
+   The camera can only be tested on a real device, so this reports what
+   actually happened rather than leaving a silent failure.
+   ========================================================================= */
+
+const diag = {
+  enabled: /[?&]debug=1/.test(location.search),
+  sent: 0, results: 0, hands: 0, sendErrors: 0,
+  lastError: null, lastGesture: null, notes: {}, fps: 0,
+  _t0: 0, _f0: 0,
+
+  reset() {
+    this.sent = this.results = this.hands = this.sendErrors = 0;
+    this.lastError = null; this.notes = {};
+    this._t0 = performance.now(); this._f0 = 0;
+  },
+  note(k, v) { this.notes[k] = v; },
+  fail(k, err) { this.notes[k] = 'FAILED: ' + ((err && (err.name + ' ' + err.message)) || err); },
+
+  render() {
+    const el = document.getElementById('diagPanel');
+    if (!el) return;
+    el.hidden = !this.enabled;
+    if (!this.enabled) return;
+    const now = performance.now();
+    if (now - this._t0 > 1000) {
+      this.fps = Math.round((this.sent - this._f0) * 1000 / (now - this._t0));
+      this._t0 = now; this._f0 = this.sent;
+    }
+    const rows = [
+      ['secure ctx', String(window.isSecureContext)],
+      ['stream', this.notes.stream || '-'],
+      ['video', this.notes.video || '-'],
+      ['frame aspect', this.notes.aspect || '-'],
+      ['MediaPipe', typeof window.Hands === 'function' ? 'loaded' : 'MISSING'],
+      ['frames sent', String(this.sent)],
+      ['results in', String(this.results)],
+      ['fps', String(this.fps)],
+      ['hands seen', String(this.hands)],
+      ['gesture', this.lastGesture || 'none'],
+      ['send errors', String(this.sendErrors)],
+    ];
+    if (this.notes.play) rows.push(['play', this.notes.play]);
+    if (this.notes.getUserMedia) rows.push(['getUserMedia', this.notes.getUserMedia]);
+    if (this.lastError) rows.push(['last error', this.lastError]);
+    rows.push(['ua', navigator.userAgent.slice(0, 60)]);
+    el.innerHTML = rows.map(([k, v]) =>
+      `<span class="diag-k"></span><span class="diag-v"></span>`).join('');
+    [...el.querySelectorAll('.diag-k')].forEach((n, i) => { n.textContent = rows[i][0]; });
+    [...el.querySelectorAll('.diag-v')].forEach((n, i) => { n.textContent = rows[i][1]; });
+  },
+};
 
 /* =========================================================================
    Meme display — two stacked layers that cross-fade
@@ -424,7 +497,16 @@ function onResults(results) {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
   const hands = results.multiHandLandmarks || [];
-  updateGesture(detect(hands), performance.now());
+  const aspect = (w && h) ? w / h : 1;
+  const raw = detect(hands, aspect);
+
+  diag.results++;
+  diag.hands = hands.length;
+  diag.lastGesture = raw;
+  diag.note('aspect', `${w}x${h} = ${aspect.toFixed(3)}`);
+  diag.render();
+
+  updateGesture(raw, performance.now());
 
   if (hands.length && window.drawConnectors) {
     const tint = active ? '#7c9cff' : '#4ade80';
@@ -446,7 +528,8 @@ function onResults(results) {
    ========================================================================= */
 
 let hands  = null;
-let camera = null;
+let stream = null;
+let rafId  = null;
 
 function showError(message) {
   camSpinner.hidden = true;
@@ -478,19 +561,47 @@ function describeCameraError(err) {
   }
 }
 
-/** Ask for the camera ourselves so permission failures surface cleanly. */
-async function probeCamera() {
+/** Open the camera. Acquired exactly once — see start(). */
+async function openStream() {
   if (!window.isSecureContext) {
     throw Object.assign(new Error('insecure context'), { name: 'SecurityError' });
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw Object.assign(new Error('getUserMedia unavailable'), { name: 'NotSupportedError' });
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: rearFacing ? 'environment' : 'user' },
+  return navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: rearFacing ? 'environment' : 'user',
+      width:  { ideal: isLowPower() ? 480 : 640 },
+      height: { ideal: isLowPower() ? 360 : 480 },
+    },
     audio: false,
   });
-  stream.getTracks().forEach((t) => t.stop());  // MediaPipe opens its own
+}
+
+function stopStream() {
+  if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+}
+
+/** Resolve once the video actually has pixels, or reject if it never does. */
+function waitForVideo(timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const check = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2) return resolve();
+      if (Date.now() - t0 > timeoutMs) {
+        return reject(Object.assign(
+          new Error('camera opened but never produced a frame'), { name: 'AbortError' }));
+      }
+      setTimeout(check, 100);
+    };
+    check();
+  });
 }
 
 /** Phones get the lighter model so the frame rate stays usable. */
@@ -511,7 +622,7 @@ function buildHands() {
       `https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_VERSION}/${file}`,
   });
   hands.setOptions({
-    maxNumHands: 2,                                // two hands, for 🫶
+    maxNumHands: 2,                                // two hands, for the heart
     modelComplexity: isLowPower() ? 0 : 1,
     minDetectionConfidence: 0.7,
     minTrackingConfidence: 0.5,
@@ -524,11 +635,42 @@ async function start() {
   errorEl.hidden = true;
   camSpinner.hidden = false;
   setStatus('', 'Starting…');
+  diag.reset();
+
+  // The camera is opened ONCE and handed straight to the video element.
+  // An earlier version probed with getUserMedia, stopped the tracks, then let
+  // MediaPipe's Camera helper open its own stream. Desktops reacquire
+  // instantly; phones often hand back a stream that never emits a frame, which
+  // looked like "nothing works" with no error to show for it.
+  try {
+    stopStream();
+    stream = await openStream();
+    diag.note('stream', stream.getVideoTracks().map((t) => {
+      const st = t.getSettings ? t.getSettings() : {};
+      return `${st.width || '?'}x${st.height || '?'} ${st.facingMode || ''}`;
+    }).join(', '));
+  } catch (err) {
+    diag.fail('getUserMedia', err);
+    showError(describeCameraError(err));
+    return;
+  }
+
+  video.srcObject = stream;
+  video.setAttribute('playsinline', '');   // iOS refuses to play inline without it
+  video.muted = true;
+  try {
+    await video.play();
+  } catch (err) {
+    diag.note('play', 'rejected: ' + (err && err.name));   // often plays anyway
+  }
 
   try {
-    await probeCamera();
+    await waitForVideo();
+    diag.note('video', `${video.videoWidth}x${video.videoHeight}`);
   } catch (err) {
-    showError(describeCameraError(err));
+    diag.fail('video', err);
+    showError('The camera opened but never sent a frame. Close any other app using '
+            + 'the camera, then hit Retry.');
     return;
   }
 
@@ -536,37 +678,28 @@ async function start() {
   try {
     detector = buildHands();
   } catch (err) {
+    diag.fail('hands', err);
     showError(err.message);
     return;
   }
 
-  if (typeof window.Camera !== 'function') {
-    showError('MediaPipe camera utilities failed to load. Check your connection and reload.');
-    return;
-  }
+  // Drive frames ourselves rather than via MediaPipe's Camera helper, so a
+  // stalled or throwing send() is visible instead of silently swallowed.
+  let busy = false;
+  const pump = () => {
+    rafId = requestAnimationFrame(pump);
+    if (busy || video.readyState < 2) return;
+    busy = true;
+    diag.sent++;
+    Promise.resolve()
+      .then(() => detector.send({ image: video }))
+      .catch((err) => { diag.sendErrors++; diag.lastError = String((err && err.message) || err); })
+      .finally(() => { busy = false; });
+  };
+  rafId = requestAnimationFrame(pump);
 
-  if (camera) {
-    try { camera.stop(); } catch (_) { /* already stopped */ }
-  }
-
-  const short = isLowPower();
-  camera = new window.Camera(video, {
-    width:  short ? 480 : 640,
-    height: short ? 360 : 480,
-    facingMode: rearFacing ? 'environment' : 'user',
-    onFrame: async () => {
-      try { await detector.send({ image: video }); }
-      catch (_) { /* a dropped frame is not worth tearing the app down for */ }
-    },
-  });
-
-  try {
-    await camera.start();
-    setStatus('ready', 'Show me a hand');
-    if (await hasMultipleCameras()) flipBtn.hidden = false;
-  } catch (err) {
-    showError(describeCameraError(err));
-  }
+  setStatus('ready', 'Show me a hand');
+  hasMultipleCameras().then((multi) => { if (multi) flipBtn.hidden = false; });
 }
 
 async function hasMultipleCameras() {
@@ -589,16 +722,25 @@ retryBtn.addEventListener('click', start);
 
 // Release the camera when the tab is hidden; pick it back up on return.
 document.addEventListener('visibilitychange', () => {
-  if (!camera) return;
   if (document.hidden) {
-    try { camera.stop(); } catch (_) { /* noop */ }
-  } else if (errorEl.hidden) {
-    camera.start().catch((err) => showError(describeCameraError(err)));
+    stopStream();
+  } else if (errorEl.hidden && !stream) {
+    start();
   }
 });
 
 /* ---------------- go ---------------- */
 
+window.__diag = diag;   // for debugging from the console
+
 buildLegend();
 preload();
+
+// Tap the status badge to show the diagnostics readout.
+document.querySelector('.stage-badge').addEventListener('click', () => {
+  diag.enabled = !diag.enabled;
+  diag.render();
+});
+diag.render();
+
 start();

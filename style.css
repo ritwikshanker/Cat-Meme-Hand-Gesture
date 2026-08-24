@@ -368,3 +368,32 @@ body {
   .memeLayer.is-pop { animation: none; }
   .chip.is-active { transform: none; }
 }
+
+/* ---------------- diagnostics readout ---------------- */
+.diag {
+  position: absolute;
+  top: 46px;
+  left: 10px;
+  right: 10px;
+  z-index: 4;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1px 10px;
+  max-height: 60%;
+  overflow: auto;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: rgba(6, 8, 12, .88);
+  backdrop-filter: blur(6px);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .62rem;
+  line-height: 1.5;
+  color: #cdd4e6;
+}
+.diag[hidden] { display: none; }
+.diag-k { color: #7b849d; }
+.diag-v { color: #e7e9f0; word-break: break-all; }
+
+@media (min-width: 820px) {
+  .diag { top: 56px; left: 14px; right: auto; min-width: 300px; font-size: .7rem; }
+}
