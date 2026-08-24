@@ -1,0 +1,14 @@
+# Python / PyCharm scaffold left over from project creation. The site is
+# pure static HTML/CSS/JS and uses none of it. Both files are still on disk —
+# delete these two lines if you'd rather track them.
+main.py
+pyproject.toml
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store

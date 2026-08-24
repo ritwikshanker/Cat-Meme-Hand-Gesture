@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#12141b">
+<meta name="description" content="Make a hand gesture at your webcam and get the matching cat meme.">
+<title>Gesture Cat</title>
+<link rel="preload" as="image" href="images/idle.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Gesture Cat <span aria-hidden="true">🤫</span></h1>
+  <p class="tagline">Make a hand gesture at the camera. Get the cat.</p>
+</header>
+
+<main class="app" id="app">
+
+  <!-- ---------- meme stage ---------- -->
+  <section class="panel stage" id="memeStage" aria-live="polite">
+    <img id="bgLayer" class="stage-bg" src="images/idle.png" alt="" aria-hidden="true">
+    <img id="layerA" class="memeLayer is-visible" src="images/idle.png" alt="">
+    <img id="layerB" class="memeLayer" src="" alt="">
+    <p class="stage-badge"><span class="dot" id="statusDot"></span><span id="statusText">Starting…</span></p>
+    <p class="stage-caption" id="caption">Waiting for a gesture…</p>
+  </section>
+
+  <!-- ---------- camera (PiP on phones, side panel on desktop) ---------- -->
+  <section class="panel cam" id="cam">
+    <div class="cam-inner">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="cam-spinner" id="camSpinner"><span class="spinner"></span></div>
+      <button class="cam-flip" id="flipBtn" type="button" title="Switch camera" aria-label="Switch camera" hidden>⟲</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ---------- gesture legend ---------- -->
+<section class="legend" aria-label="Supported gestures">
+  <div class="legend-scroll" id="legend"></div>
+  <p class="legend-hint">Tap any gesture to preview its cat.</p>
+</section>
+
+<!-- ---------- camera error ---------- -->
+<div class="sheet" id="camError" hidden>
+  <div class="sheet-card">
+    <h2>Camera unavailable</h2>
+    <p id="camErrorMsg">Something went wrong.</p>
+    <button id="retryBtn" class="btn" type="button">Retry</button>
+    <p class="sheet-hint">Camera access needs <strong>https://</strong> or <strong>localhost</strong>.
+    You can still tap gestures below to browse the cats.</p>
+  </div>
+</div>
+
+<footer class="foot">
+  <p>Runs entirely in your browser — no video ever leaves this device.</p>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script src="script.js"></script>
+
+</body>
+</html>
