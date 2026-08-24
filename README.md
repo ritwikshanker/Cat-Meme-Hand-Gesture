@@ -85,8 +85,16 @@ here — browsers refuse camera access without it.
 
 ### GitHub Pages
 
-Pages serves over HTTPS on `*.github.io`, so the camera works. Create an empty
-repo on GitHub, then:
+Pages serves over HTTPS on `*.github.io`, so the camera works.
+
+**The repo has to be public on the free plan** — GitHub Free only offers
+"GitHub Pages in public repositories". Pages from a private repo needs Pro or
+above, and even then the published *site* is still public; restricting who can
+view the site itself requires an organization on Enterprise Cloud. Nothing here
+is sensitive, so public is fine — but if you'd rather not publish the source,
+use Netlify Drop below instead.
+
+Create an empty repo on GitHub, then:
 
 ```bash
 git remote add origin https://github.com/<you>/<repo>.git
